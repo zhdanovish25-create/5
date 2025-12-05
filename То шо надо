@@ -1,0 +1,408 @@
+// ============================================================================
+// Лабораторная работа №5: Разработка люксметра на базе Arduino UNO с FreeRTOS
+// Автор: [Ваше имя]
+// Дата: [Дата]
+// ============================================================================
+
+#include <Arduino_FreeRTOS.h>
+#include <queue.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ThreeWire.h>
+#include <RtcDS1302.h>
+
+// ============================================================================
+// Конфигурация оборудования
+// ============================================================================
+
+// Дисплей I2C 16x2
+#define LCD_ADDRESS 0x27
+#define LCD_COLS 16
+#define LCD_ROWS 2
+LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLS, LCD_ROWS);
+
+// Часы реального времени DS1302
+ThreeWire myWire(4, 5, 2);  // DAT, CLK, RST
+RtcDS1302<ThreeWire> Rtc(myWire);
+
+// Фоторезистор на аналоговом входе A0
+#define LDR_PIN A0
+
+// ============================================================================
+// Структуры данных и глобальные переменные
+// ============================================================================
+
+// Структура для передачи данных через очередь
+typedef struct {
+    float lux;          // Освещённость в люксах
+    uint32_t timestamp; // Временная метка
+    int adcValue;       // Сырое значение АЦП (для отладки)
+} LuxData_t;
+
+// Структура для калибровочных точек
+struct CalibrationPoint {
+    int adc;
+    float lux;
+};
+
+// Калибровочные данные (заполняются экспериментально)
+const CalibrationPoint CalibrationData[] = {
+    {0, 0.0},
+    {200, 10.0},
+    {400, 150.0},
+    {450, 200.0},
+    {550, 350.0},
+    {650, 550.0},
+    {750, 850.0},
+    {850, 1200.0},
+    {950, 1800.0},
+    {1023, 2500.0}
+};
+
+const int CalibrationSize = sizeof(CalibrationData) / sizeof(CalibrationPoint);
+
+// Глобальные хэндлы FreeRTOS
+QueueHandle_t xLuxQueue;
+QueueHandle_t xLogQueue;
+SemaphoreHandle_t xDisplayMutex;
+SemaphoreHandle_t xSerialMutex;
+
+// Константы времени
+const TickType_t xMeasureDelay = pdMS_TO_TICKS(200);    // 200 мс
+const TickType_t xDisplayUpdateDelay = pdMS_TO_TICKS(500); // 500 мс (2 раза в секунду)
+const TickType_t xRTCDelay = pdMS_TO_TICKS(1000);       // 1 секунда
+
+// Буфер для усреднения измерений
+#define AVG_BUFFER_SIZE 10
+float luxBuffer[AVG_BUFFER_SIZE];
+int bufferIndex = 0;
+
+// ============================================================================
+// Прототипы функций
+// ============================================================================
+float calculateLuxFromADC(int adcValue);
+float movingAverage(float newValue);
+float interpolateLinear(float x, float x1, float y1, float x2, float y2);
+void printToSerial(const char* format, ...);
+void checkRTC();
+void initializeRTC();
+
+// ============================================================================
+// Функция интерполяции освещённости по калибровочным данным
+// ============================================================================
+float calculateLuxFromADC(int adcValue) {
+    // Проверка граничных условий
+    if (adcValue <= CalibrationData[0].adc) {
+        return CalibrationData[0].lux;
+    }
+    
+    if (adcValue >= CalibrationData[CalibrationSize - 1].adc) {
+        return CalibrationData[CalibrationSize - 1].lux;
+    }
+    
+    // Поиск интервала для интерполяции с использованием бинарного поиска
+    int low = 0;
+    int high = CalibrationSize - 1;
+    int mid = 0;
+    
+    while (low <= high) {
+        mid = (low + high) / 2;
+        
+        if (adcValue == CalibrationData[mid].adc) {
+            return CalibrationData[mid].lux;
+        }
+        
+        if (adcValue < CalibrationData[mid].adc) {
+            high = mid - 1;
+        } else {
+            low = mid + 1;
+        }
+    }
+    
+    // Найден интервал для линейной интерполяции
+    int idx = (adcValue < CalibrationData[mid].adc) ? mid - 1 : mid;
+    
+    if (idx < 0) idx = 0;
+    if (idx >= CalibrationSize - 1) idx = CalibrationSize - 2;
+    
+    // Линейная интерполяция
+    float D1 = CalibrationData[idx].adc;
+    float E1 = CalibrationData[idx].lux;
+    float D2 = CalibrationData[idx + 1].adc;
+    float E2 = CalibrationData[idx + 1].lux;
+    
+    return interpolateLinear(adcValue, D1, E1, D2, E2);
+}
+
+// ============================================================================
+// Вспомогательные функции
+// ============================================================================
+float interpolateLinear(float x, float x1, float y1, float x2, float y2) {
+    if (x2 == x1) return y1; // Защита от деления на ноль
+    return y1 + (y2 - y1) * ((x - x1) / (x2 - x1));
+}
+
+float movingAverage(float newValue) {
+    // Добавляем новое значение в буфер
+    luxBuffer[bufferIndex] = newValue;
+    bufferIndex = (bufferIndex + 1) % AVG_BUFFER_SIZE;
+    
+    // Вычисляем среднее значение
+    float sum = 0.0;
+    int count = 0;
+    
+    for (int i = 0; i < AVG_BUFFER_SIZE; i++) {
+        if (luxBuffer[i] != 0.0) { // Игнорируем нулевые значения
+            sum += luxBuffer[i];
+            count++;
+        }
+    }
+    
+    return (count > 0) ? (sum / count) : newValue;
+}
+
+void printToSerial(const char* format, ...) {
+    xSemaphoreTake(xSerialMutex, portMAX_DELAY);
+    
+    char buffer[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    
+    Serial.print(buffer);
+    
+    xSemaphoreGive(xSerialMutex);
+}
+
+// ============================================================================
+// Работа с RTC DS1302
+// ============================================================================
+void initializeRTC() {
+    Rtc.Begin();
+    
+    // Проверка, работает ли RTC
+    RtcDateTime compiled = RtcDateTime(__DATE__, __TIME__);
+    
+    if (!Rtc.IsDateTimeValid()) {
+        // Установка времени компиляции, если RTC не был инициализирован
+        Rtc.SetDateTime(compiled);
+        printToSerial("RTC initialized with compile time\n");
+    }
+    
+    if (!Rtc.GetIsRunning()) {
+        Rtc.SetIsRunning(true);
+        printToSerial("RTC started\n");
+    }
+    
+    // Проверка, нужна ли настройка времени
+    RtcDateTime now = Rtc.GetDateTime();
+    if (now < compiled) {
+        Rtc.SetDateTime(compiled);
+        printToSerial("RTC updated to compile time\n");
+    }
+}
+
+void checkRTC() {
+    if (!Rtc.IsDateTimeValid()) {
+        printToSerial("RTC lost confidence in the DateTime!\n");
+    }
+}
+
+// ============================================================================
+// Задача 1: Измерение освещённости
+// ============================================================================
+void vTaskMeasureLuminosity(void *pvParameters) {
+    LuxData_t dataToSend;
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    
+    for (;;) {
+        // Шаг 1: Чтение АЦП
+        int adcValue = analogRead(LDR_PIN);
+        
+        // Шаг 2: Преобразование в люксы через интерполяцию
+        float lux = calculateLuxFromADC(adcValue);
+        
+        // Шаг 3: Усреднение (фильтрация)
+        float filteredLux = movingAverage(lux);
+        
+        // Шаг 4: Подготовка данных для отправки
+        dataToSend.lux = filteredLux;
+        dataToSend.adcValue = adcValue;
+        dataToSend.timestamp = millis();
+        
+        // Шаг 5: Отправка в очередь (с таймаутом)
+        BaseType_t xStatus = xQueueSend(xLuxQueue, &dataToSend, pdMS_TO_TICKS(10));
+        
+        if (xStatus != pdPASS) {
+            // Очередь заполнена - можно добавить индикацию ошибки
+            printToSerial("[WARN] Lux queue full!\n");
+            
+            // Попробуем перезаписать последний элемент (без блокировки)
+            xQueueOverwrite(xLuxQueue, &dataToSend);
+        }
+        
+        // Шаг 6: Задержка для периодического выполнения
+        vTaskDelayUntil(&xLastWakeTime, xMeasureDelay);
+    }
+}
+
+// ============================================================================
+// Задача 2: Отображение на LCD
+// ============================================================================
+void vTaskDisplay(void *pvParameters) {
+    LuxData_t receivedData;
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    static uint32_t lastDisplayTime = 0;
+    
+    for (;;) {
+        // Пытаемся получить данные из очереди (без блокировки)
+        if (xQueueReceive(xLuxQueue, &receivedData, 0) == pdPASS) {
+            // Обновляем дисплей не чаще, чем раз в 500 мс
+            uint32_t currentTime = millis();
+            if (currentTime - lastDisplayTime >= 500) {
+                xSemaphoreTake(xDisplayMutex, portMAX_DELAY);
+                
+                // Очистка и вывод на дисплей
+                lcd.clear();
+                
+                // Первая строка: освещённость
+                lcd.setCursor(0, 0);
+                lcd.print("Lux: ");
+                lcd.print(receivedData.lux, 1);
+                
+                // Вторая строка: статус и АЦП
+                lcd.setCursor(0, 1);
+                lcd.print("ADC:");
+                lcd.print(receivedData.adcValue);
+                lcd.print(" RTOS");
+                
+                lastDisplayTime = currentTime;
+                xSemaphoreGive(xDisplayMutex);
+            }
+        }
+        
+        // Задержка для освобождения процессорного времени
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(50));
+    }
+}
+
+// ============================================================================
+// Задача 3: Логирование в Serial и работа с RTC
+// ============================================================================
+void vTaskLogger(void *pvParameters) {
+    LuxData_t logData;
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    
+    for (;;) {
+        // Чтение времени с RTC
+        RtcDateTime now = Rtc.GetDateTime();
+        
+        // Проверка целостности RTC
+        checkRTC();
+        
+        // Форматирование времени
+        char timeStr[20];
+        snprintf(timeStr, sizeof(timeStr), "%04d-%02d-%02d %02d:%02d:%02d",
+                 now.Year(), now.Month(), now.Day(),
+                 now.Hour(), now.Minute(), now.Second());
+        
+        // Пытаемся получить данные из очереди
+        if (xQueueReceive(xLuxQueue, &logData, 0) == pdPASS) {
+            // Вывод в Serial
+            printToSerial("[%s] ADC: %4d, Lux: %6.1f, Age: %lu ms\n",
+                          timeStr, logData.adcValue, logData.lux,
+                          millis() - logData.timestamp);
+        } else {
+            // Вывод только времени, если нет новых данных
+            printToSerial("[%s] RTC update (no new lux data)\n", timeStr);
+        }
+        
+        // Задержка 1 секунда
+        vTaskDelayUntil(&xLastWakeTime, xRTCDelay);
+    }
+}
+
+// ============================================================================
+// Настройка (Setup)
+// ============================================================================
+void setup() {
+    // Инициализация Serial
+    Serial.begin(115200);
+    while (!Serial);
+    
+    printToSerial("========================================\n");
+    printToSerial("Люксметр на Arduino UNO с FreeRTOS\n");
+    printToSerial("Лабораторная работа №5\n");
+    printToSerial("========================================\n");
+    
+    // Инициализация дисплея
+    lcd.init();
+    lcd.backlight();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Luxmeter v1.0");
+    lcd.setCursor(0, 1);
+    lcd.print("Initializing...");
+    
+    // Инициализация RTC
+    initializeRTC();
+    
+    // Инициализация буфера усреднения
+    for (int i = 0; i < AVG_BUFFER_SIZE; i++) {
+        luxBuffer[i] = 0.0;
+    }
+    
+    // Создание объектов синхронизации FreeRTOS
+    xLuxQueue = xQueueCreate(10, sizeof(LuxData_t));
+    xDisplayMutex = xSemaphoreCreateMutex();
+    xSerialMutex = xSemaphoreCreateMutex();
+    
+    if (xLuxQueue == NULL || xDisplayMutex == NULL || xSerialMutex == NULL) {
+        printToSerial("[ERROR] Failed to create RTOS objects!\n");
+        lcd.clear();
+        lcd.print("RTOS Error!");
+        while (1); // Остановка при ошибке
+    }
+    
+    // Вывод информации о системе
+    printToSerial("System initialized\n");
+    printToSerial("Calibration points: %d\n", CalibrationSize);
+    printToSerial("Queue size: 10 elements\n");
+    printToSerial("Measurement interval: 200 ms\n");
+    printToSerial("========================================\n");
+    
+    // Обновление дисплея
+    lcd.clear();
+    lcd.print("FreeRTOS Ready");
+    lcd.setCursor(0, 1);
+    lcd.print("Starting tasks...");
+    
+    delay(1000);
+    
+    // Создание задач (с разными приоритетами)
+    // 3 - высший приоритет (измерение)
+    // 2 - средний приоритет (логирование)
+    // 1 - низший приоритет (дисплей)
+    xTaskCreate(vTaskMeasureLuminosity, "Measure", 256, NULL, 3, NULL);
+    xTaskCreate(vTaskLogger, "Logger", 256, NULL, 2, NULL);
+    xTaskCreate(vTaskDisplay, "Display", 256, NULL, 1, NULL);
+    
+    printToSerial("Tasks created successfully\n");
+    printToSerial("FreeRTOS scheduler starting...\n");
+    
+    // Запуск планировщика FreeRTOS
+    vTaskStartScheduler();
+    
+    // Если планировщик не запустился
+    printToSerial("[ERROR] Failed to start scheduler!\n");
+    while (1);
+}о
+
+// ============================================================================
+// Основной цикл (не используется в FreeRTOS)
+// ============================================================================
+void loop() {
+    // В FreeRTOS основной цикл не используется
+    // Все задачи выполняются планировщиком
+}т
